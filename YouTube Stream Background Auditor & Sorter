@@ -1,0 +1,652 @@
+// ==UserScript==
+// @name         YouTube Stream Background Auditor & Sorter
+// @namespace    local.yt.dimmer
+// @version      51.0
+// @description  3-way mode toggle: Live + Regular (filter live, keep regular), Live Only, or Filter All. Accurately sorts fresh streams to top.
+// @match        *://*.youtube.com/*
+// @match        https://*.youtube.com/*
+// @match        https://youtube.com/*
+// @run-at       document-end
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    if (location.pathname.startsWith('/live_chat') || location.pathname.startsWith('/embed')) {
+        return;
+    }
+
+    // ==========================================
+    // 3 MODES: 'LIVE_AND_REGULAR' | 'LIVE_ONLY' | 'FILTER_ALL'
+    // ==========================================
+    const MODES = [
+        { id: 'LIVE_AND_REGULAR', label: 'Mode: Live + Regular', color: '#15803d' }, // Green (Filter live, keep regular)
+        { id: 'LIVE_ONLY',        label: 'Mode: Live Only',      color: '#b91c1c' }, // Red (Hide regular videos)
+        { id: 'FILTER_ALL',       label: 'Mode: Filter All',     color: '#1d4ed8' }  // Blue (Filter everything)
+    ];
+
+    const savedModeId = localStorage.getItem('yt_audit_3way_mode') || 'LIVE_AND_REGULAR';
+    let currentModeIndex = Math.max(0, MODES.findIndex(m => m.id === savedModeId));
+
+    const DEFAULT_CONFIG = {
+        maxHours: 2,             // Cutoff: streams older than this are removed/dimmed
+        maxMinutes: 0,
+        minViewers: 30,          // Streams with fewer viewers are flagged as cyclical
+        dimOpacity: '0.25',      // Opacity for dimmed active player/cards
+        dimBrightness: '0.25',   // Brightness for dimmed active player/cards
+        dimGrayscale: '0.85',    // Desaturation
+        removeOldVideos: true,   // true = completely hides old live streams
+        sortFreshToTop: true     // true = sorts streams started "?? minutes ago" to top
+    };
+
+    const savedHours = localStorage.getItem('yt_audit_max_hours');
+    const savedMins = localStorage.getItem('yt_audit_max_mins');
+    const CONFIG = {
+        ...DEFAULT_CONFIG,
+        maxHours: savedHours !== null ? parseInt(savedHours, 10) : DEFAULT_CONFIG.maxHours,
+        maxMinutes: savedMins !== null ? parseInt(savedMins, 10) : DEFAULT_CONFIG.maxMinutes
+    };
+
+    function getMaxAllowedMinutes() {
+        return (CONFIG.maxHours * 60) + CONFIG.maxMinutes;
+    }
+
+    const CYCLICAL_REGEX = /(?:24\/7|24-7|24\s*H(?:OURS?)?|\bLOOP(?:ING)?\b|\bREPLAY\b|\bRERUN\b|\bCOUNTDOWN\b|\bPRE-?RECORDED\b|\bNON-?STOP\b|\bCONTINUOUS\b|\bRESTREAM\b|\bAUTOMATED\b|\bPLAYLIST\b)/i;
+
+    const auditCache = new Map();
+    const pendingFetches = new Set();
+    const loggedEntries = new Set();
+
+    let isMinimized = false;
+    let userOverrodeWatchPlayer = false;
+
+    function createEl(tag, styles = {}, text = '') {
+        const el = document.createElement(tag);
+        if (styles && Object.keys(styles).length) Object.assign(el.style, styles);
+        if (text) el.textContent = text;
+        return el;
+    }
+
+    // 1. Strict Stream Age Parser
+    function parseStreamAgeInMinutes(text) {
+        if (!text) return null;
+
+        const hourMatch = text.match(/(?:started streaming|streamed live|streamed)\s+(\d+)\s*hours?\s*ago/i);
+        if (hourMatch) return parseInt(hourMatch[1], 10) * 60;
+
+        const minMatch = text.match(/(?:started streaming|streamed live|streamed)\s+(\d+)\s*(?:minute|min)s?\s*ago/i);
+        if (minMatch) return parseInt(minMatch[1], 10);
+
+        const dayMatch = text.match(/(?:started streaming|streamed live|streamed)\s+(\d+)\s*days?\s*ago/i);
+        if (dayMatch) return parseInt(dayMatch[1], 10) * 24 * 60;
+
+        const weekMatch = text.match(/(?:started streaming|streamed live|streamed)\s+(\d+)\s*weeks?\s*ago/i);
+        if (weekMatch) return parseInt(weekMatch[1], 10) * 7 * 24 * 60;
+
+        const yearMatch = text.match(/(?:started streaming|streamed live|streamed)\s+(\d+)\s*years?\s*ago/i);
+        if (yearMatch) return parseInt(yearMatch[1], 10) * 365 * 24 * 60;
+
+        const dateMatch = text.match(/(?:started streaming on|streamed on|streamed live on)\s+([A-Za-z]+\s+\d{1,2}(?:,\s*\d{4})?)/i);
+        if (dateMatch) {
+            let dateStr = dateMatch[1];
+            if (!dateStr.includes(',')) dateStr += `, ${new Date().getFullYear()}`;
+            const parsed = Date.parse(dateStr);
+            if (!isNaN(parsed)) {
+                const diffMs = Date.now() - parsed;
+                if (diffMs > 0) return Math.floor(diffMs / (1000 * 60));
+            }
+        }
+        return null;
+    }
+
+    function parseViewers(text) {
+        if (!text) return null;
+        const m = text.match(/([\d,.]+)\s*([kKmM]?)\s*(?:watching|viewers|वाचिंग)/i);
+        if (!m) return null;
+        let n = parseFloat(m[1].replace(/,/g, ''));
+        const unit = (m[2] || '').toUpperCase();
+        if (unit === 'K') n *= 1000;
+        if (unit === 'M') n *= 1000000;
+        return Math.round(n);
+    }
+
+    // 2. Background Watch Page Inspector
+    function inspectWatchPageInBackground(videoId) {
+        if (!videoId || auditCache.has(videoId) || pendingFetches.has(videoId)) return;
+        pendingFetches.add(videoId);
+
+        fetch(`https://www.youtube.com/watch?v=${videoId}`)
+            .then(res => res.text())
+            .then(html => {
+                let ageMinutes = null;
+                let description = '';
+                let isOld = false;
+                let reason = '';
+
+                const startMatch = html.match(/"startTimestamp":"([^"]+)"/) || html.match(/itemprop="startDate" content="([^"]+)"/);
+                if (startMatch && startMatch[1]) {
+                    const startTime = Date.parse(startMatch[1]);
+                    if (!isNaN(startTime)) ageMinutes = Math.floor((Date.now() - startTime) / (1000 * 60));
+                }
+
+                if (ageMinutes === null) ageMinutes = parseStreamAgeInMinutes(html);
+
+                const descMatch = html.match(/"shortDescription":"((?:[^"\\]|\\.)*)"/);
+                if (descMatch) {
+                    try { description = JSON.parse(`"${descMatch[1]}"`); } catch (e) { description = descMatch[1]; }
+                }
+
+                const maxAllowedMins = getMaxAllowedMinutes();
+
+                if (ageMinutes !== null && ageMinutes > maxAllowedMins) {
+                    isOld = true;
+                    reason = `Started ${(ageMinutes / 60).toFixed(1)}h ago (> ${CONFIG.maxHours}h)`;
+                } else if (CYCLICAL_REGEX.test(description)) {
+                    isOld = true;
+                    const m = description.match(CYCLICAL_REGEX);
+                    reason = `Description keyword: "${m ? m[0] : '24/7'}"`;
+                }
+
+                auditCache.set(videoId, { ageMinutes, isOld, reason, description });
+                auditEverything();
+            })
+            .catch(() => {
+                auditCache.set(videoId, { ageMinutes: null, isOld: false, reason: 'Fetch failed' });
+            })
+            .finally(() => {
+                pendingFetches.delete(videoId);
+            });
+    }
+
+    // 3. Mount Audit Console Window (with 3-Way Mode Switch)
+    function ensureConsole() {
+        if (!document.body) return;
+
+        const existingBoxes = document.querySelectorAll('#yt-stream-audit-box');
+        if (existingBoxes.length > 1) {
+            for (let i = 1; i < existingBoxes.length; i++) existingBoxes[i].remove();
+        }
+        if (existingBoxes.length > 0) return;
+
+        const box = createEl('div');
+        box.id = 'yt-stream-audit-box';
+        box.style.cssText = `
+            position: fixed !important;
+            top: 70px !important;
+            right: 20px !important;
+            width: 380px !important;
+            max-height: 520px !important;
+            background: #111111 !important;
+            border: 2px solid #22c55e !important;
+            border-radius: 10px !important;
+            z-index: 2147483647 !important;
+            box-shadow: 0 12px 40px rgba(0,0,0,0.95) !important;
+            display: flex !important;
+            flex-direction: column !important;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+            color: #ffffff !important;
+            overflow: hidden !important;
+            user-select: none !important;
+        `;
+
+        const header = createEl('div', {
+            background: '#1a1a1a',
+            padding: '10px 14px',
+            borderBottom: '1px solid #333',
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            cursor: 'grab'
+        });
+
+        const title = createEl('div', {
+            fontWeight: 'bold',
+            fontSize: '13px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px'
+        });
+
+        const liveDot = createEl('span', {
+            width: '8px',
+            height: '8px',
+            borderRadius: '50%',
+            background: '#22c55e',
+            display: 'inline-block'
+        });
+
+        const titleText = createEl('span', {}, 'Stream Auditor');
+        title.appendChild(liveDot);
+        title.appendChild(titleText);
+
+        const actions = createEl('div', { display: 'flex', gap: '5px' });
+
+        // 3-Way Mode Toggle Button
+        const currentMode = MODES[currentModeIndex];
+        const modeBtn = createEl('button', {
+            background: currentMode.color,
+            color: '#fff',
+            border: 'none',
+            padding: '3px 8px',
+            borderRadius: '4px',
+            cursor: 'pointer',
+            fontSize: '10px',
+            fontWeight: 'bold'
+        }, currentMode.label);
+
+        const cfgBtn = createEl('button', {
+            background: '#2d2d2d',
+            color: '#fff',
+            border: 'none',
+            padding: '3px 7px',
+            borderRadius: '4px',
+            cursor: 'pointer',
+            fontSize: '10px'
+        }, `Cutoff: ${CONFIG.maxHours}h`);
+
+        const toggleBtn = createEl('button', {
+            background: '#2d2d2d',
+            color: '#fff',
+            border: 'none',
+            padding: '3px 7px',
+            borderRadius: '4px',
+            cursor: 'pointer',
+            fontSize: '11px'
+        }, '—');
+
+        actions.appendChild(modeBtn);
+        actions.appendChild(cfgBtn);
+        actions.appendChild(toggleBtn);
+        header.appendChild(title);
+        header.appendChild(actions);
+
+        const stats = createEl('div', {
+            background: '#141414',
+            padding: '6px 14px',
+            borderBottom: '1px solid #222',
+            display: 'flex',
+            justifyContent: 'space-between',
+            fontSize: '11px'
+        });
+
+        const liveStat = createEl('span', { color: '#22c55e', fontWeight: 'bold' }, 'Live: 0');
+        liveStat.id = 'yt-stat-live';
+
+        const remStat = createEl('span', { color: '#ef4444', fontWeight: 'bold' }, 'Filtered Out: 0');
+        remStat.id = 'yt-stat-removed';
+
+        stats.appendChild(liveStat);
+        stats.appendChild(remStat);
+
+        const feed = createEl('div', {
+            flex: '1',
+            overflowY: 'auto',
+            padding: '10px',
+            background: '#0d0d0d',
+            maxHeight: '400px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '6px'
+        });
+        feed.id = 'yt-audit-feed';
+
+        box.appendChild(header);
+        box.appendChild(stats);
+        box.appendChild(feed);
+        document.body.appendChild(box);
+
+        // Click Handler: Cycle through 3 Modes
+        modeBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            currentModeIndex = (currentModeIndex + 1) % MODES.length;
+            const nextMode = MODES[currentModeIndex];
+            localStorage.setItem('yt_audit_3way_mode', nextMode.id);
+            modeBtn.textContent = nextMode.label;
+            modeBtn.style.background = nextMode.color;
+            loggedEntries.clear();
+            feed.replaceChildren();
+            auditEverything();
+        });
+
+        cfgBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const inputHours = prompt('Enter Max Allowed Stream Age in HOURS:', CONFIG.maxHours);
+            if (inputHours === null) return;
+            const h = parseInt(inputHours, 10);
+            if (!isNaN(h) && h >= 0) {
+                CONFIG.maxHours = h;
+                localStorage.setItem('yt_audit_max_hours', h);
+                cfgBtn.textContent = `Cutoff: ${h}h`;
+                userOverrodeWatchPlayer = false;
+
+                auditCache.forEach((item) => {
+                    if (item.ageMinutes !== null) {
+                        item.isOld = item.ageMinutes > getMaxAllowedMinutes() || CYCLICAL_REGEX.test(item.description || '');
+                    }
+                });
+                auditEverything();
+            }
+        });
+
+        toggleBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            isMinimized = !isMinimized;
+            feed.style.display = isMinimized ? 'none' : 'flex';
+            stats.style.display = isMinimized ? 'none' : 'flex';
+            box.style.maxHeight = isMinimized ? '44px' : '520px';
+            toggleBtn.textContent = isMinimized ? '□' : '—';
+        });
+
+        let isDragging = false, startX, startY, initX, initY;
+        header.addEventListener('mousedown', (e) => {
+            if (e.target.tagName === 'BUTTON') return;
+            isDragging = true;
+            header.style.cursor = 'grabbing';
+            const rect = box.getBoundingClientRect();
+            startX = e.clientX;
+            startY = e.clientY;
+            initX = rect.left;
+            initY = rect.top;
+            box.style.right = 'auto';
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            box.style.left = `${initX + (e.clientX - startX)}px`;
+            box.style.top = `${initY + (e.clientY - startY)}px`;
+        });
+
+        window.addEventListener('mouseup', () => {
+            isDragging = false;
+            header.style.cursor = 'grab';
+        });
+    }
+
+    function logToConsole(title, url, viewers, isRemoved, label) {
+        const feed = document.getElementById('yt-audit-feed');
+        if (!feed || loggedEntries.has(url)) return;
+        loggedEntries.add(url);
+
+        const row = createEl('div', {
+            padding: '6px 8px',
+            background: isRemoved ? 'rgba(239, 68, 68, 0.1)' : 'rgba(34, 197, 94, 0.1)',
+            borderRadius: '4px',
+            fontSize: '11px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '2px'
+        });
+
+        const top = createEl('div', {
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center'
+        });
+
+        const badge = createEl('span', {
+            fontSize: '10px',
+            fontWeight: 'bold',
+            color: isRemoved ? '#ef4444' : '#22c55e'
+        }, isRemoved ? 'FILTERED' : 'GENUINE LIVE');
+
+        const vText = createEl('span', { color: '#888', fontSize: '10px' }, viewers || '');
+        top.appendChild(badge);
+        top.appendChild(vText);
+
+        const link = createEl('a', {
+            color: '#eee',
+            textDecoration: 'none',
+            fontWeight: '500',
+            fontSize: '11px',
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis'
+        }, title);
+        link.href = url;
+        link.target = '_blank';
+
+        const sub = createEl('div', {
+            fontSize: '10px',
+            color: isRemoved ? '#fca5a5' : '#86efac'
+        }, label);
+
+        row.appendChild(top);
+        row.appendChild(link);
+        row.appendChild(sub);
+        feed.insertBefore(row, feed.firstChild);
+    }
+
+    // 4. Watch Page Active Player Dimmer & Warning Banner
+    function auditWatchPagePlayer() {
+        if (location.pathname !== '/watch') return;
+
+        const player = document.querySelector('#movie_player, .html5-video-player');
+        const video = document.querySelector('video.html5-main-video, #movie_player video');
+        const infoBlock = document.querySelector('ytd-watch-metadata, #info-contents, #description-inner, #above-the-fold');
+        const infoText = infoBlock ? (infoBlock.innerText || infoBlock.textContent || '') : '';
+
+        const isLive = /watching now|watching/i.test(infoText) || document.querySelector('.ytp-live, .badge-style-type-live-now') !== null;
+        if (!isLive) return;
+
+        const ageMinutes = parseStreamAgeInMinutes(infoText);
+        const maxAllowedMins = getMaxAllowedMinutes();
+        const hasLoop = CYCLICAL_REGEX.test(infoText);
+        const viewers = parseViewers(infoText);
+
+        const isOverCutoff = (ageMinutes !== null && ageMinutes > maxAllowedMins);
+        const shouldDim = !userOverrodeWatchPlayer && (isOverCutoff || hasLoop);
+
+        let banner = document.getElementById('yt-watch-dim-banner');
+
+        if (shouldDim) {
+            if (player) {
+                player.style.setProperty('filter', `grayscale(${CONFIG.dimGrayscale}) brightness(${CONFIG.dimBrightness})`, 'important');
+                player.style.setProperty('opacity', CONFIG.dimOpacity, 'important');
+                player.style.setProperty('transition', 'filter 0.3s ease, opacity 0.3s ease', 'important');
+            }
+            if (video) video.style.setProperty('filter', `grayscale(${CONFIG.dimGrayscale}) brightness(${CONFIG.dimBrightness})`, 'important');
+
+            if (!banner && player) {
+                banner = createEl('div');
+                banner.id = 'yt-watch-dim-banner';
+                banner.style.cssText = `
+                    position: absolute !important;
+                    top: 15px !important;
+                    left: 50% !important;
+                    transform: translateX(-50%) !important;
+                    background: rgba(18, 18, 18, 0.95) !important;
+                    border: 2px solid #ef4444 !important;
+                    color: #fff !important;
+                    padding: 8px 16px !important;
+                    border-radius: 8px !important;
+                    font-size: 13px !important;
+                    font-weight: bold !important;
+                    z-index: 2147483646 !important;
+                    display: flex !important;
+                    align-items: center !important;
+                    gap: 12px !important;
+                    box-shadow: 0 8px 24px rgba(0,0,0,0.9) !important;
+                `;
+
+                const hoursRan = ageMinutes ? (ageMinutes / 60).toFixed(1) : `${CONFIG.maxHours}+`;
+                const msg = createEl('span', {}, `⚠️ Stream Started ${hoursRan}h ago (Exceeds ${CONFIG.maxHours}h Cutoff)`);
+                const undimBtn = createEl('button', {
+                    background: '#2563eb',
+                    color: '#fff',
+                    border: 'none',
+                    padding: '4px 10px',
+                    borderRadius: '4px',
+                    cursor: 'pointer',
+                    fontSize: '11px',
+                    fontWeight: 'bold'
+                }, 'Un-dim');
+
+                undimBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    userOverrodeWatchPlayer = true;
+                    if (player) {
+                        player.style.removeProperty('filter');
+                        player.style.removeProperty('opacity');
+                    }
+                    if (video) video.style.removeProperty('filter');
+                    banner.remove();
+                });
+
+                banner.appendChild(msg);
+                banner.appendChild(undimBtn);
+                player.parentElement.appendChild(banner);
+            }
+
+            const currentTitle = document.querySelector('h1.ytd-watch-metadata, #title h1')?.textContent?.trim() || 'Current Live Stream';
+            logToConsole(currentTitle, location.href, viewers ? `${viewers.toLocaleString()} watching` : '', true, `Started ${(ageMinutes / 60).toFixed(1)}h ago (> ${CONFIG.maxHours}h)`);
+
+        } else if (player && !shouldDim) {
+            player.style.removeProperty('filter');
+            player.style.removeProperty('opacity');
+            if (video) video.style.removeProperty('filter');
+            if (banner) banner.remove();
+        }
+    }
+
+    // 5. Search Results & Recommended Cards Filter Engine
+    function auditSearchAndCards() {
+        const activeMode = MODES[currentModeIndex].id;
+
+        const cards = Array.from(document.querySelectorAll([
+            'ytd-video-renderer',
+            'ytd-rich-item-renderer',
+            'yt-lockup-view-model',
+            'ytd-compact-video-renderer'
+        ].join(', ')));
+
+        let liveCount = 0;
+        let removedCount = 0;
+        const maxAllowedMinutes = getMaxAllowedMinutes();
+
+        cards.forEach((card, idx) => {
+            const text = (card.innerText || card.textContent || '');
+
+            const viewers = parseViewers(text);
+            const hasWatching = viewers !== null;
+            const hasLiveBadge = card.querySelector('[overlay-style="LIVE"], .badge-style-type-live-now, .badge-shape-wiz--thumbnail-live, badge-shape.badge-shape-wiz--live') !== null ||
+                                 Array.from(card.querySelectorAll('span, badge-shape')).some(el => el.textContent.trim().toUpperCase() === 'LIVE');
+
+            const isPastBroadcastVOD = /\bstreamed\s+\d+\s*(?:year|month|week|day|hour|min)s?\s*ago/i.test(text) || /\bstreamed\s+on\b/i.test(text);
+            const isLiveStream = (hasWatching || hasLiveBadge) && !isPastBroadcastVOD;
+
+            // ==========================================================
+            // REGULAR UPLOADED NON-LIVE VIDEOS
+            // ==========================================================
+            if (!isLiveStream && !isPastBroadcastVOD) {
+                if (activeMode === 'LIVE_AND_REGULAR') {
+                    // MODE 1: KEEP REGULAR VIDEOS 100% UNFILTERED & LISTED!
+                    card.style.removeProperty('display');
+                    card.style.removeProperty('order');
+                    return;
+                } else if (activeMode === 'LIVE_ONLY') {
+                    // MODE 2: HIDE REGULAR VIDEOS COMPLETELY
+                    card.style.setProperty('display', 'none', 'important');
+                    removedCount++;
+                    return;
+                }
+                // MODE 3 (FILTER_ALL) continues below to evaluate regular uploads
+            }
+
+            // ==========================================================
+            // LIVE STREAM & PAST VOD AUDIT
+            // ==========================================================
+            const linkEl = card.querySelector('a#video-title, a#video-title-link, a#thumbnail, a[href*="/watch"]');
+            const href = linkEl && linkEl.href ? linkEl.href.split('&')[0] : `item-${idx}`;
+            let videoId = null;
+            if (linkEl && linkEl.href) {
+                const matchId = linkEl.href.match(/[?&]v=([^&]+)/);
+                if (matchId) videoId = matchId[1];
+            }
+
+            const titleEl = card.querySelector('#video-title, #video-title-link, h3, #title, .yt-core-attributed-string');
+            const title = titleEl ? titleEl.textContent.trim() : `Stream ${idx + 1}`;
+
+            let ageMinutes = parseStreamAgeInMinutes(text);
+            let isOld = false;
+            let statusReason = '';
+
+            if (isPastBroadcastVOD) {
+                isOld = true;
+                statusReason = 'Past broadcast';
+            } else if (ageMinutes !== null && ageMinutes > maxAllowedMinutes) {
+                isOld = true;
+                statusReason = `Started ${(ageMinutes / 60).toFixed(1)}h ago (> ${CONFIG.maxHours}h)`;
+            } else if (CYCLICAL_REGEX.test(text)) {
+                isOld = true;
+                statusReason = 'Cyclical loop keyword';
+            }
+
+            // Background inspection for streams with hidden start details
+            if (videoId) {
+                if (auditCache.has(videoId)) {
+                    const cached = auditCache.get(videoId);
+                    if (cached.isOld) {
+                        isOld = true;
+                        statusReason = cached.reason;
+                    }
+                    if (ageMinutes === null && cached.ageMinutes !== null) {
+                        ageMinutes = cached.ageMinutes;
+                        if (ageMinutes > maxAllowedMinutes) {
+                            isOld = true;
+                            statusReason = `Started ${(ageMinutes / 60).toFixed(1)}h ago (> ${CONFIG.maxHours}h)`;
+                        }
+                    }
+                } else if (!isOld && ageMinutes === null) {
+                    inspectWatchPageInBackground(videoId);
+                }
+            }
+
+            if (isOld) {
+                removedCount++;
+                if (CONFIG.removeOldVideos) {
+                    card.style.setProperty('display', 'none', 'important');
+                }
+                logToConsole(title, href, viewers ? `${viewers.toLocaleString()} watching` : '', true, statusReason);
+            } else {
+                liveCount++;
+                card.style.removeProperty('display');
+
+                if (CONFIG.sortFreshToTop) {
+                    const sortOrder = ageMinutes !== null ? ageMinutes : 999;
+                    card.style.setProperty('order', sortOrder, 'important');
+                    const parent = card.parentElement;
+                    if (parent && (parent.id === 'contents' || parent.tagName.toLowerCase().includes('section'))) {
+                        parent.style.setProperty('display', 'flex', 'important');
+                        parent.style.setProperty('flex-direction', 'column', 'important');
+                    }
+                }
+
+                const timeLabel = ageMinutes !== null ? `Started ${ageMinutes}m ago` : 'Fresh Live';
+                logToConsole(title, href, viewers ? `${viewers.toLocaleString()} watching` : 'LIVE', false, timeLabel);
+            }
+        });
+
+        const lStat = document.getElementById('yt-stat-live');
+        const rStat = document.getElementById('yt-stat-removed');
+        if (lStat) lStat.textContent = `Live: ${liveCount}`;
+        if (rStat) rStat.textContent = `Filtered Out: ${removedCount}`;
+    }
+
+    function auditEverything() {
+        ensureConsole();
+        auditWatchPagePlayer();
+        auditSearchAndCards();
+    }
+
+    window.addEventListener('yt-navigate-finish', () => {
+        userOverrodeWatchPlayer = false;
+        loggedEntries.clear();
+        const feed = document.getElementById('yt-audit-feed');
+        if (feed) feed.replaceChildren();
+        const banner = document.getElementById('yt-watch-dim-banner');
+        if (banner) banner.remove();
+    });
+
+    setInterval(auditEverything, 500);
+})();
